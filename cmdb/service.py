@@ -2,7 +2,7 @@ import datetime
 import socket
 import struct
 from dateutil.parser import parse
-from sqlalchemy import or_
+from sqlalchemy import or_, func, distinct, select
 from .models import db, Schema, Field, FieldHistory, Relationship, Entity, Value, ValueHistory
 
 
@@ -11,12 +11,12 @@ def is_datetime(origin):
         return origin
     if isinstance(origin, str):
         try:
-            return True, parse(origin)
+            return True, parse(origin).timestamp()
         except:
             return False, None
     if isinstance(origin, (int, float)):
         try:
-            return True, datetime.datetime.fromtimestamp(origin)
+            return True, datetime.datetime.fromtimestamp(origin).timestamp()
         except:
             return False, None
     return False
@@ -121,14 +121,76 @@ class SchemaService:
             db.session.rollback()
             raise e
 
+    @staticmethod
+    def remove_field(field_id):
+        field = Field.query.filter(Field.id == field_id).first_or_404()
+        if not SchemaService.field_deletable(field):
+            raise Exception()
+        field.deleted = True
+        fh = FieldHistory(name=field.name,
+                          schema_id=field.schema_id,
+                          display=field.display,
+                          type=field.type,
+                          required=field.required,
+                          multi=field.multi,
+                          unique=field.unique,
+                          default=field.default,
+                          deleted=True,
+                          field=field,
+                          timestamp=datetime.datetime.now())
+        try:
+            db.session.add(field)
+            db.session.add(fh)
+            db.session.commit(field)
+        except Exception as e:
+            db.session.rollback()
+            raise e
 
     @staticmethod
-    def remove_field(schema_id, data):
-        pass
-
-    @staticmethod
-    def change_field(schema_id, field_id, data):
-        pass
+    def change_field(field_id, data):
+        try:
+            field = Field.query.filter(Field.id == field_id).first_or_404()
+            field.name = data['name']
+            field.display = data.get('display', data['name'])
+            if data.get('default') is not None:
+                ok, ret = type_validate_map[field.type](data.get('default'))
+                if ok:
+                    data['default'] = ret
+                else:
+                    raise TypeError()
+            field.default = data.get('default')
+            if field.unique is False:
+                if data.get('unique', False) is True:
+                    c1 = Value.query.filter(Value.field_id == field.id).count()
+                    c2 = db.session.query(func.count(distinct(Value.value))).filter(Value.field_id == field.id)
+                    if c1 != c2:
+                        raise Exception()
+                field.unique = data.get('unique', False)
+            if field.required is False:
+                if data.get('required', False) is True:
+                    if field.multi:
+                        for entity in Entity.query.filter(Entity.schema_id == field.schema_id).all():
+                            if Value.query.filter(Value.entity_id == entity.id).first() is None:
+                                raise Exception()
+                    else:
+                        c1 = Entity.query.filter(Entity.schema_id == field.schema_id).count()
+                        c2 = Value.query.filter(Value.field_id == field.id).count()
+                        if c1 != c2:
+                            raise Exception
+                field.required = data.get('required', False)
+            if field.multi is True:
+                if data.get('multi', False) is False:
+                    stmt = select([Value.entity_id, func.count(Value.id)])\
+                        .select_from(Value).group_by(Value.entity_id)\
+                        .having(func.count(Value.id) > 0)
+                    if len(db._engine.connect().execute(stmt).fetch_all()) > 0:
+                        raise Exception()
+                field.multi = data.get('multi', False)
+            db.session.add(field)
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            raise e
 
     @staticmethod
     def field_deletable(field):
